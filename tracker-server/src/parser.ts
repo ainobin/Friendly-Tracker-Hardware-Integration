@@ -50,16 +50,22 @@ export interface V8Packet extends CommonFields {
   net_mnc: string;
   net_lac: string;
   net_cellid: string;
-  bssid_1: string;
-  rssi_1: string;
-  bssid_2: string;
-  rssi_2: string;
-  bssid_3: string;
-  rssi_3: string;
   satellite_signal: number;
   network_signal: number;
   voltage_v: number;
   battery_pct: number;
+  /**
+   * True when the device includes the optional 3x BSSID/RSSI WiFi block
+   * (27-element form, NEW-EN field table lines 99–110).
+   * False when firmware omits it (21-element form, NEW-EN summary lines 52–54).
+   */
+  has_wifi: boolean;
+  bssid_1?: string;
+  rssi_1?: string;
+  bssid_2?: string;
+  rssi_2?: string;
+  bssid_3?: string;
+  rssi_3?: string;
 }
 
 export type TrackerPacket = V6Packet | V8Packet;
@@ -142,29 +148,78 @@ function parseV6(el: string[], common: CommonFields): V6Packet | null {
   };
 }
 
+/**
+ * V8 arrives in two shapes depending on firmware/runtime conditions:
+ *
+ *  21 elements — NEW-EN summary format (lines 52–54), no WiFi block:
+ *      0..16 common+net, 17 sat, 18 signal, 19 voltage, 20 bat
+ *
+ *  27 elements — NEW-EN field table (lines 99–110), with 3x BSSID/RSSI:
+ *      0..16 common+net, 17..22 wifi, 23 sat, 24 signal, 25 voltage, 26 bat
+ *
+ * Observed from the physical device: both forms occur (Banglalink,
+ * 116.58.201.79 / 103.197.154.12). Detect by content, not by assuming.
+ */
+function isMacLike(v: string | undefined): boolean {
+  return typeof v === "string" && /^(0x)?[0-9a-fA-F]{12}$/.test(v);
+}
+
+/** 121 * 0.1 is 12.100000000000001 in IEEE754 — round before storing. */
+function parseVoltage(v: string | undefined): number {
+  const n = parseInt(v ?? "", 10);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 0.1 * 10) / 10;
+}
+
 function parseV8(el: string[], common: CommonFields): V8Packet | null {
-  // V8 needs 27 elements (index 0–26) with WiFi fields
-  if (el.length < 27) {
-    console.error("V8 packet too short:", el.length, "elements (need 27)");
+  if (el.length < 21) {
+    console.error("V8 packet too short:", el.length, "elements (need 21)");
     return null;
   }
 
-  return {
+  const base = {
     ...common,
-    data_type: "V8",
+    data_type: "V8" as const,
     net_mcc: el[13],
     net_mnc: el[14],
     net_lac: el[15],
     net_cellid: el[16],
-    bssid_1: el[17],
-    rssi_1: el[18],
-    bssid_2: el[19],
-    rssi_2: el[20],
-    bssid_3: el[21],
-    rssi_3: el[22],
-    satellite_signal: parseInt(el[23], 10) || 0,
-    network_signal: parseInt(el[24], 10) || 0,
-    voltage_v: (parseInt(el[25], 10) || 0) * 0.1,
-    battery_pct: parseInt(el[26], 10) || 0,
+  };
+
+  const hasWifi =
+    el.length >= 27 && isMacLike(el[17]) && isMacLike(el[19]) && isMacLike(el[21]);
+
+  if (hasWifi) {
+    return {
+      ...base,
+      has_wifi: true,
+      bssid_1: el[17],
+      rssi_1: el[18],
+      bssid_2: el[19],
+      rssi_2: el[20],
+      bssid_3: el[21],
+      rssi_3: el[22],
+      satellite_signal: parseInt(el[23], 10) || 0,
+      network_signal: parseInt(el[24], 10) || 0,
+      voltage_v: parseVoltage(el[25]),
+      battery_pct: parseInt(el[26], 10) || 0,
+    };
+  }
+
+  if (el.length >= 27) {
+    // Long enough for WiFi but index 17 isn't a MAC — log it, still parse
+    // with the compact layout so telemetry is not lost.
+    console.warn(
+      `V8: ${el.length} elements but el[17]=${el[17]} is not a BSSID; using compact layout`
+    );
+  }
+
+  return {
+    ...base,
+    has_wifi: false,
+    satellite_signal: parseInt(el[17], 10) || 0,
+    network_signal: parseInt(el[18], 10) || 0,
+    voltage_v: parseVoltage(el[19]),
+    battery_pct: parseInt(el[20], 10) || 0,
   };
 }

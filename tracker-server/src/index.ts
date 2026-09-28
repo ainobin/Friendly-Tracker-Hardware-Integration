@@ -18,6 +18,7 @@ const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 // Lazy-load Redis/PG so the server starts even without them
 let redis: any = null;
 let pgPool: any = null;
+let pgReady = false;
 
 async function initRedis() {
   try {
@@ -37,14 +38,38 @@ async function initPostgres() {
     console.warn("DATABASE_URL not set, PostgreSQL disabled");
     return;
   }
-  try {
-    const { Pool } = await import("pg");
-    pgPool = new Pool({ connectionString: dbUrl });
-    await pgPool.query("SELECT 1");
-    console.log("PostgreSQL connected");
-  } catch (err) {
-    console.warn("PostgreSQL not available:", (err as Error).message);
-    pgPool = null;
+
+  const { Pool } = await import("pg");
+
+  // Create the pool unconditionally. pg.Pool recovers automatically once the
+  // backend is reachable, so we must NOT null it out on the first failure —
+  // that previously left the server permanently unable to write after a
+  // docker-compose startup race (ECONNREFUSED).
+  pgPool = new Pool({ connectionString: dbUrl, max: 10 });
+  pgPool.on("error", (err: Error) => {
+    console.error("PostgreSQL idle client error:", err.message);
+  });
+
+  // Poll until Postgres is ready instead of giving up on first refusal.
+  const deadline = Date.now() + 120_000;
+  let delay = 1000;
+  for (;;) {
+    try {
+      await pgPool.query("SELECT 1");
+      pgReady = true;
+      console.log("PostgreSQL connected");
+      return;
+    } catch (err) {
+      if (Date.now() > deadline) {
+        console.warn(
+          "PostgreSQL still unreachable after 120s; pool kept alive, will recover later:",
+          (err as Error).message
+        );
+        return;
+      }
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 15_000);
+    }
   }
 }
 
@@ -57,8 +82,29 @@ async function publishPosition(packet: any) {
   }
 }
 
+let lastReadyProbe = 0;
+async function ensurePostgresReady(): Promise<boolean> {
+  if (!pgPool) return false;
+  if (pgReady) return true;
+
+  // Throttle the probe so a long outage doesn't hammer the log.
+  const now = Date.now();
+  if (now - lastReadyProbe < 5_000) return false;
+  lastReadyProbe = now;
+
+  try {
+    await pgPool.query("SELECT 1");
+    pgReady = true;
+    console.log("PostgreSQL connected");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function insertPosition(packet: any) {
   if (!pgPool) return;
+  if (!(await ensurePostgresReady())) return;
   try {
     // Ensure device row exists first (V6 only arrives on boot, but V8 comes
     // continuously and tracker_positions has an FK to devices)
@@ -187,21 +233,25 @@ server.on("error", (err) => {
 
 // --- Start ---
 
-async function main() {
+function main() {
   console.log("=== ST-904L Tracker Server ===");
   console.log(`Protocol: Tianqin (NEW-EN)`);
-  console.log(`V8 WiFi fields: enabled (27 elements)`);
+  console.log(`V8 formats: 21 (compact) and 27 (with WiFi) — auto-detected`);
 
-  await initRedis();
-  await initPostgres();
-
+  // Listen first: the TCP accept loop must not wait on slow/absent
+  // dependencies. Packets are parsed and acknowledged immediately; Redis and
+  // Postgres catch up in the background and are skipped if absent.
   server.listen(PORT, () => {
     console.log(`TCP server listening on port ${PORT}`);
     console.log(`Waiting for tracker connections...`);
   });
+
+  initRedis();
+  initPostgres();
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
 });
+
+main();

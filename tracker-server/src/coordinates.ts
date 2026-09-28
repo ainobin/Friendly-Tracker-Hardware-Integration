@@ -36,9 +36,10 @@ export function convertLongitude(raw: string, dir: string): number {
 /**
  * Convert speed from knots to km/h.
  * 1 knot = 1.852 km/h  (NEW-EN line 28, 79)
+ * Rounded to 2dp — otherwise 14.28 * 1.852 yields 26.446560000000002.
  */
 export function knotsToKmh(knots: number): number {
-  return knots * 1.852;
+  return Math.round(knots * 1.852 * 100) / 100;
 }
 
 /**

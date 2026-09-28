@@ -8,8 +8,10 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://user:pass@postgres:5432/friendlytracker
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "require('net').createConnection(5000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
@@ -21,6 +23,11 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
   postgres:
@@ -34,6 +41,11 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d friendlytracker"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
 volumes:
